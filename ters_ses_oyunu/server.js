@@ -1,0 +1,40 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+const crypto = require('crypto');
+const app = express(); const server = http.createServer(app);
+const io = new Server(server, { maxHttpBufferSize: 12e6, cors: { origin: '*' } });
+app.use(express.static(path.join(__dirname, 'public')));
+const rooms = new Map();
+const makeCode = () => crypto.randomBytes(3).toString('hex').toUpperCase();
+const phases = { LOBBY:'lobby', RECORD:'record', GUESS:'guess', REVEAL:'reveal', END:'end' };
+function playerView(p) { return {id:p.id,name:p.name,score:p.score,connected:p.connected,ready:p.ready}; }
+function state(r) { return {code:r.code,hostId:r.hostId,phase:r.phase,round:r.round,speakerId:r.speakerId,players:r.players.map(playerView),submitted:r.players.filter(p => p.id!==r.speakerId && p.ready).length,expected:r.players.filter(p=>p.id!==r.speakerId).length,revealed:r.revealed,winnerId:r.winnerId}; }
+function publish(r) { io.to(r.code).emit('state',state(r)); }
+function reply(cb,result){if(typeof cb==='function') cb(result);}
+function guard(socket,cb) { const code=socket.data.room; const r=rooms.get(code); const p=r?.players.find(x=>x.id===socket.data.playerId); if(!r||!p){reply(cb,{ok:false,error:'Odaya bağlı değilsiniz.'});return null;} return {r,p}; }
+function resetRound(r){r.speakerAudio=null;r.reverseAudio=null;r.speakerText='';r.entries=[];r.revealed=[];r.winnerId=null;for(const p of r.players){p.ready=false;}}
+function clampName(v){return String(v||'').trim().slice(0,22);}
+io.on('connection',socket=>{
+ socket.on('join',({code,name,token}={},cb)=>{
+   name=clampName(name);code=String(code||'').trim().toUpperCase();if(!name)return reply(cb,{ok:false,error:'İsim girin.'});
+   let r;if(!code){do {code=makeCode()}while(rooms.has(code));r={code,hostId:null,phase:phases.LOBBY,round:0,speakerId:null,players:[],entries:[],revealed:[],speakerAudio:null,reverseAudio:null,speakerText:'',winnerId:null};rooms.set(code,r);}else{r=rooms.get(code);if(!r)return reply(cb,{ok:false,error:'Oda bulunamadı.'});}
+   let p=token?r.players.find(x=>x.token===token):null;
+   if(!p){if(r.phase!==phases.LOBBY)return reply(cb,{ok:false,error:'Oyun başladı; yeni katılım kapalı.'});if(r.players.length>=10)return reply(cb,{ok:false,error:'Oda dolu (10 kişi).'});if(r.players.some(x=>x.name.toLocaleLowerCase('tr')===name.toLocaleLowerCase('tr')))return reply(cb,{ok:false,error:'Bu isim kullanılıyor.'});p={id:crypto.randomUUID(),token:crypto.randomBytes(24).toString('hex'),name,score:0,ready:false,connected:true};r.players.push(p);}
+   const oldSocket=io.sockets.sockets.get(p.socketId);if(oldSocket&&oldSocket.id!==socket.id){oldSocket.leave(r.code);oldSocket.data.room=null;oldSocket.emit('replaced');}
+   p.socketId=socket.id;p.connected=true;socket.data.room=code;socket.data.playerId=p.id;socket.join(code);if(!r.hostId)r.hostId=p.id;
+   reply(cb,{ok:true,token:p.token,playerId:p.id,code});publish(r);
+   if(r.phase===phases.GUESS||r.phase===phases.REVEAL){if(p.id!==r.speakerId&&r.speakerAudio)socket.emit('reverse-audio',r.reverseAudio);if(r.phase===phases.REVEAL&&p.id===r.hostId)socket.emit('reveal-data',revealData(r));}
+ });
+ socket.on('start',(_,cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(p.id!==r.hostId||r.phase!==phases.LOBBY)return reply(cb,{ok:false,error:'Başlatma yetkisi yok.'});if(r.players.length<2)return reply(cb,{ok:false,error:'En az 2 oyuncu gerekli.'});r.round=1;r.speakerId=r.players[0].id;r.phase=phases.RECORD;resetRound(r);publish(r);reply(cb,{ok:true});});
+ socket.on('speaker-submit',({audio,reverseAudio,text}={},cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(r.phase!==phases.RECORD||p.id!==r.speakerId)return reply(cb,{ok:false,error:'Şu anda ses gönderemezsiniz.'});if(typeof audio!=='string'||audio.length<100||audio.length>9e6)return reply(cb,{ok:false,error:'Ses kaydı geçersiz veya çok büyük. 15 saniyeden kısa kayıt kullanın.'});if(typeof reverseAudio!=='string'||!/^data:audio\//.test(reverseAudio)||reverseAudio.length>9e6||reverseAudio.length<100)return reply(cb,{ok:false,error:'Ters kayıt geçersiz.'});if(!/^data:audio\//.test(audio))return reply(cb,{ok:false,error:'Ses formatı geçersiz.'});r.speakerAudio=audio;r.reverseAudio=reverseAudio;r.speakerText=String(text||'').trim().slice(0,160);r.phase=phases.GUESS;r.entries=[];r.revealed=[];for(const q of r.players){if(q.id!==p.id&&q.connected)io.to(q.socketId).emit('reverse-audio',audio);}publish(r);reply(cb,{ok:true});});
+ socket.on('submit-guess',({audio,guess}={},cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(r.phase!==phases.GUESS||p.id===r.speakerId||p.ready)return reply(cb,{ok:false,error:'Bu aşamada gönderemezsiniz.'});if(typeof audio!=='string'||!/^data:audio\//.test(audio)||audio.length>9e6||audio.length<100)return reply(cb,{ok:false,error:'Ses kaydı eksik veya çok büyük.'});guess=String(guess||'').trim().slice(0,160);if(!guess)return reply(cb,{ok:false,error:'Tahmininizi yazın.'});p.ready=true;r.entries.push({playerId:p.id,audio,guess,at:Date.now(),correct:null});reply(cb,{ok:true});const expected=r.players.filter(x=>x.id!==r.speakerId).length;if(r.entries.length===expected){r.phase=phases.REVEAL;io.to(r.players.find(x=>x.id===r.hostId)?.socketId).emit('reveal-data',revealData(r));}publish(r);});
+ socket.on('force-reveal',(_,cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(p.id!==r.hostId||r.phase!==phases.GUESS)return reply(cb,{ok:false,error:'Bu aşama açılamıyor.'});if(!r.entries.length)return reply(cb,{ok:false,error:'Henüz tahmin yok.'});r.phase=phases.REVEAL;io.to(r.players.find(x=>x.id===r.hostId)?.socketId).emit('reveal-data',revealData(r));publish(r);reply(cb,{ok:true});});
+ socket.on('get-reveal',(_,cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(r.phase!==phases.REVEAL||p.id!==r.hostId)return reply(cb,{ok:false,error:'Yetki yok.'});reply(cb,{ok:true,data:revealData(r)});});
+ socket.on('judge',({playerId,correct}={},cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(p.id!==r.hostId||r.phase!==phases.REVEAL)return reply(cb,{ok:false,error:'Yalnızca kurucu puan verebilir.'});const e=r.entries.find(x=>x.playerId===playerId);if(!e||e.correct!==null)return reply(cb,{ok:false,error:'Bu tahmin zaten değerlendirildi.'});e.correct=!!correct;const priorCorrect=r.entries.filter(x=>x.correct===true).length-(e.correct?1:0);const awarded=e.correct?Math.max(1,10-priorCorrect):0;const target=r.players.find(x=>x.id===e.playerId);target.score+=awarded;r.revealed.push({playerId,correct:e.correct,awarded});publish(r);io.to(r.code).emit('judged',{playerId,correct:e.correct,awarded,guess:e.guess,audio:e.audio});reply(cb,{ok:true,awarded});});
+ socket.on('next-round',(_,cb)=>{const a=guard(socket,cb);if(!a)return;const {r,p}=a;if(p.id!==r.hostId||r.phase!==phases.REVEAL)return reply(cb,{ok:false,error:'Tur geçirilemiyor.'});if(r.entries.some(x=>x.correct===null))return reply(cb,{ok:false,error:'Tüm tahminleri değerlendirin.'});const winners=r.players.filter(x=>x.score>=100).sort((x,y)=>y.score-x.score);if(winners.length){r.phase=phases.END;r.winnerId=winners[0].id;}else{const index=r.players.findIndex(x=>x.id===r.speakerId);r.speakerId=r.players[(index+1)%r.players.length].id;r.round++;r.phase=phases.RECORD;resetRound(r);}publish(r);reply(cb,{ok:true});});
+ socket.on('disconnect',()=>{const r=rooms.get(socket.data.room);const p=r?.players.find(x=>x.id===socket.data.playerId);if(!p||p.socketId!==socket.id)return;p.connected=false;if(p.id===r.hostId){const other=r.players.find(x=>x.connected);if(other)r.hostId=other.id;}publish(r);});
+});
+function revealData(r){return {speakerText:r.speakerText,entries:r.entries.map((e,i)=>({...e,rank:i+1,name:r.players.find(p=>p.id===e.playerId)?.name})),speakerAudio:r.speakerAudio};}
+const PORT=process.env.PORT||3000;server.listen(PORT,()=>console.log(`Listening on ${PORT}`));
